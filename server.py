@@ -8,8 +8,6 @@ API: https://mcp.lumeclaw.ru/api/v1
 import sys
 import json
 import os
-import time
-import hashlib
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -17,15 +15,21 @@ from typing import Any, Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
 API_BASE = os.environ.get("LUMECLAW_API_BASE", "https://mcp.lumeclaw.ru/api/v1")
-API_KEY  = os.environ.get("LUMECLAW_API_KEY", "")
+API_KEY = os.environ.get("LUMECLAW_API_KEY", "")
 
-def _api_request(method: str, path: str, body: Any = None,
-                 token: Optional[str] = None) -> Any:
+
+def _api_request(method: str, path: str, body: Any = None) -> Any:
+    """Make API request with X-API-Key auth (no JWT needed)."""
+    if not API_KEY:
+        raise RuntimeError("Set LUMECLAW_API_KEY environment variable")
+
     url = API_BASE.rstrip("/") + "/" + path.lstrip("/")
     data = json.dumps(body).encode() if body is not None else None
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"{token}"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-API-Key": API_KEY,
+    }
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -37,14 +41,6 @@ def _api_request(method: str, path: str, body: Any = None,
         except Exception:
             err = {"detail": body_bytes.decode(errors="replace")}
         raise RuntimeError(f"HTTP {e.code}: {err.get('detail', str(err))}")
-
-
-def _get_token() -> str:
-    if not API_KEY:
-        raise RuntimeError(
-            "Set LUMECLAW_API_KEY environment variable"
-        )
-    return API_KEY
 
 
 # ── Tool implementations ──────────────────────────────────────────────────────
@@ -62,13 +58,12 @@ def tool_memory_store(args: dict) -> str:
         payload["agent_id"] = args["agent_id"]
     if args.get("project_id"):
         payload["project_id"] = args["project_id"]
-    tok = _get_token()
     try:
-        resp = _api_request("POST", "/memory", payload, token=tok)
+        resp = _api_request("POST", "/memory/key", payload)
         return f"✅ Stored memory [{resp['id']}]\nContent: {resp['content'][:120]}"
     except RuntimeError as e:
         if "409" in str(e) or "duplicate" in str(e).lower():
-            return f"ℹ️ Memory already exists (duplicate content)"
+            return "ℹ️ Memory already exists (duplicate content)"
         raise
 
 
@@ -76,18 +71,31 @@ def tool_memory_search(args: dict) -> str:
     query = args.get("query", "").strip()
     if not query:
         return "Error: query is required"
-    params = f"query={urllib.parse.quote(query)}&limit={args.get('limit', 5)}"
+    payload = {
+        "query": query,
+        "limit": args.get("limit", 5),
+    }
     if args.get("category"):
-        params += f"&category={args['category']}"
-    if args.get("agent_id"):
-        params += f"&agent_id={args['agent_id']}"
-    tok = _get_token()
-    resp = _api_request("GET", f"/memory/search?{params}", token=tok)
+        payload["category"] = args["category"]
+    try:
+        resp = _api_request("POST", "/memory/search/key", payload)
+    except RuntimeError as e:
+        if "404" in str(e):
+            # Fallback: try GET with query params
+            params = f"query={urllib.parse.quote(query)}&limit={args.get('limit', 5)}"
+            if args.get("category"):
+                params += f"&category={args['category']}"
+            resp = _api_request("GET", f"/memory/key?{params}")
+            if not resp:
+                return "No matching memories found."
+        else:
+            raise
     if not resp:
         return "No matching memories found."
     lines = []
     for i, m in enumerate(resp, 1):
-        score_pct = round(float(m.get("score", 0)) * 100, 1)
+        sim = m.get("similarity", m.get("score", 0))
+        score_pct = round(float(sim) * 100, 1) if float(sim) <= 1.0 else round(float(sim), 1)
         lines.append(f"{i}. [{score_pct}% match | {m['category']}] {m['content'][:200]}")
         if m.get("tags"):
             lines.append(f"   Tags: {', '.join(m['tags'])}")
@@ -100,8 +108,7 @@ def tool_memory_list(args: dict) -> str:
         params += f"&category={args['category']}"
     if args.get("agent_id"):
         params += f"&agent_id={args['agent_id']}"
-    tok = _get_token()
-    resp = _api_request("GET", f"/memory?{params}", token=tok)
+    resp = _api_request("GET", f"/memory/key?{params}")
     if not resp:
         return "No memories found."
     lines = []
@@ -115,8 +122,7 @@ def tool_memory_get(args: dict) -> str:
     mid = args.get("memory_id", "").strip()
     if not mid:
         return "Error: memory_id is required"
-    tok = _get_token()
-    resp = _api_request("GET", f"/memory/{mid}", token=tok)
+    resp = _api_request("GET", f"/memory/{mid}/key")
     tags_str = ", ".join(resp.get("tags") or [])
     return (
         f"ID: {resp['id']}\n"
@@ -131,21 +137,13 @@ def tool_memory_delete(args: dict) -> str:
     mid = args.get("memory_id", "").strip()
     if not mid:
         return "Error: memory_id is required"
-    tok = _get_token()
-    url = API_BASE.rstrip("/") + f"/memory/{mid}"
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": f"{tok}", "Accept": "application/json"},
-        method="DELETE",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            pass
+        _api_request("DELETE", f"/memory/{mid}/key")
         return f"✅ Deleted memory {mid}"
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
+    except RuntimeError as e:
+        if "404" in str(e):
             return f"Memory {mid} not found"
-        raise RuntimeError(f"HTTP {e.code}")
+        raise
 
 
 TOOLS = {
@@ -165,7 +163,7 @@ TOOLS = {
         "fn": tool_memory_store,
     },
     "memory_search": {
-        "description": "Search shared LumeClaw memory semantically.",
+        "description": "Search shared LumeClaw memory semantically using vector similarity.",
         "inputSchema": {
             "type": "object",
             "required": ["query"],
@@ -236,7 +234,7 @@ def handle(req: dict) -> Optional[dict]:
                 "capabilities": {"tools": {}},
                 "serverInfo": {
                     "name": "memory-lumeclaw",
-                    "version": "1.0.0",
+                    "version": "2.0.0",
                 },
             },
         }
